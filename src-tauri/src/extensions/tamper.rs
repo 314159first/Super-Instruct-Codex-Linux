@@ -1,6 +1,6 @@
-// M3: TamperEngine — 22 条正则规则检测拒绝响应并替换
+// M3: TamperEngine — 31 条正则规则检测拒绝响应并替换
 // 自门控: modified_body 已存在则跳过
-// 5语言 x 4优先级
+// P0 平台审核拦截 + P1-P4 模型级拒绝 (5语言 x 4优先级)
 
 use crate::core::{ResponseCtx, ResponseInterceptor};
 use regex::Regex;
@@ -65,9 +65,15 @@ impl ResponseInterceptor for TamperEngine {
     }
 }
 
-/// 22 条篡改规则 — 5语言 x 4优先级
+/// 31 条篡改规则 — P0 平台审核拦截 + P1-P4 模型级拒绝 (5语言 x 4优先级)
 fn default_tamper_patterns() -> Vec<&'static str> {
     vec![
+        // P0: 平台级内容审核拦截 — 优先级最高，在所有规则之前
+        r"(?i)This content was flagged for possible cybersecurity risk",
+        r"(?i)flagged for.{0,20}(?:cybersecurity|security|safety|policy|violation)",
+        r"(?i)If this seems wrong.{0,30}try rephrasing",
+        r"(?i)content (?:was|has been) (?:flagged|blocked|filtered|removed)",
+        r"(?i)(?:blocked|filtered) due to (?:safety|content|usage) (?:concerns|policy|policies|violations)",
         // P1: 中文直接拒绝 + 领域关键词
         r"(?:不能|无法|做不到|不提供|不可以|不协助|不生成|不写|不改|不帮|不制作|不处理|不执行|不参与).{0,20}(?:破解|付费|VIP|会员|卡密|注册码|绕过|补丁|修改.*程序|逆向.*程序|二进制.*修改|验证.*绕过)",
         r"(?:我不会|我不能|我无法|我不).{0,20}(?:直接|主动|协助|帮助|提供|生成|制作|处理|扫描|攻击|利用|绕过|破解|逆向|修改|渗透)",
