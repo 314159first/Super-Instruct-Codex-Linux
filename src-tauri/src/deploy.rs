@@ -9,6 +9,11 @@ pub struct DeployManager {
     codex_home: PathBuf,
 }
 
+/// 本项目部署 skill 的清单文件名（记录本次部署到 ~/.codex/skills/ 的 id）
+const SKILLS_MANIFEST: &str = "super-instruct-skills-deployed.json";
+/// 被项目覆盖的同名用户 skill 备份目录
+const SKILLS_BACKUP_DIR: &str = "super-instruct-skills-backup";
+
 #[derive(Clone, Serialize)]
 pub struct DeployStatus {
     pub bridge_active: bool,
@@ -143,16 +148,38 @@ impl DeployManager {
         fs::write(&dst_bridge, bridge_md).map_err(|e| format!("write bridge.md failed: {}", e))?;
         tracing::info!("deploy: bridge.md written ({} bytes)", bridge_md.len());
 
-        // 6. 复制 skills (可选, 只复制启用的)
+        // 6. 部署 skills (可选, 只部署启用的) — 合并式管理
+        //    * 绝不删除用户自定义的其他 skill（保留 ~/.codex/skills/ 共享目录语义）
+        //    * 只管理本项目本次部署的 id（写入 manifest），供 restore 精确清理
+        //    * 部署前对同名用户 skill 先备份，避免覆盖丢失
         let skill_count = if let Some(skills_dir) = skills_dir {
             let dst_skills = self.codex_home.join("skills");
-            if dst_skills.exists() {
-                fs::remove_dir_all(&dst_skills).map_err(|e| format!("remove old skills failed: {}", e))?;
+            let manifest_file = self.codex_home.join(SKILLS_MANIFEST);
+            let backup_dir = self.codex_home.join(SKILLS_BACKUP_DIR);
+            let prefs_path = self.codex_home.join("super-instruct-skills.json");
+
+            // 上次部署清单 — 先清理上次部署的 id，并还原用户同名备份，保证可重复部署
+            let previous: std::collections::BTreeSet<String> = read_skills_manifest(&manifest_file);
+            for id in &previous {
+                let dst = dst_skills.join(id);
+                if dst.exists() {
+                    let _ = fs::remove_dir_all(&dst);
+                }
+                let bak = backup_dir.join(id);
+                if bak.exists() {
+                    if let Err(e) = copy_dir_recursive(&bak, &dst) {
+                        tracing::warn!("deploy: restore user skill '{}' failed: {}", id, e);
+                    }
+                    let _ = fs::remove_dir_all(&bak);
+                }
             }
-            fs::create_dir_all(&dst_skills).map_err(|e| format!("create skills dir failed: {}", e))?;
+            if backup_dir.exists() {
+                let _ = fs::remove_dir_all(&backup_dir);
+            }
+            fs::create_dir_all(&dst_skills)
+                .map_err(|e| format!("create skills dir failed: {}", e))?;
 
             // 读取启用列表
-            let prefs_path = self.codex_home.join("super-instruct-skills.json");
             let enabled_set: Option<std::collections::BTreeSet<String>> = if prefs_path.exists() {
                 fs::read_to_string(&prefs_path)
                     .ok()
@@ -165,6 +192,7 @@ impl DeployManager {
 
             // None = 全开; Some(空集) = 全关（用户显式禁用了所有）
             let all_enabled = enabled_set.is_none();
+            let mut deployed: std::collections::BTreeSet<String> = Default::default();
             let mut count = 0;
             if let Ok(entries) = fs::read_dir(skills_dir) {
                 for entry in entries.flatten() {
@@ -178,13 +206,30 @@ impl DeployManager {
                     } else {
                         enabled_set.as_ref().map_or(false, |s| s.contains(&id))
                     };
-                    if should_copy {
-                        let dst = dst_skills.join(&id);
-                        copy_dir_recursive(&path, &dst)
-                            .map_err(|e| format!("copy skill '{}' failed: {}", id, e))?;
-                        count += 1;
+                    if !should_copy {
+                        continue;
                     }
+                    let dst = dst_skills.join(&id);
+                    // 目标已存在同名目录且非上次项目部署 → 视为用户自定义 skill，先备份再覆盖
+                    if dst.exists() && !previous.contains(&id) {
+                        fs::create_dir_all(&backup_dir)
+                            .map_err(|e| format!("create backup dir failed: {}", e))?;
+                        let user_backup = backup_dir.join(&id);
+                        let _ = fs::remove_dir_all(&user_backup);
+                        if let Err(e) = fs::rename(&dst, &user_backup) {
+                            tracing::warn!("deploy: backup user skill '{}' failed: {}", id, e);
+                        }
+                    }
+                    copy_dir_recursive(&path, &dst)
+                        .map_err(|e| format!("copy skill '{}' failed: {}", id, e))?;
+                    deployed.insert(id);
+                    count += 1;
                 }
+            }
+
+            // 记录本次部署的 id —— restore 时据此清理，不影响用户其他 skill
+            if let Err(e) = write_skills_manifest(&manifest_file, &deployed) {
+                tracing::warn!("deploy: manifest write failed: {}", e);
             }
             count
         } else {
@@ -216,10 +261,36 @@ impl DeployManager {
             tracing::info!("restore: bridge.md removed");
         }
 
+        // 反向 skill 部署：只移除本项目部署的 id，还原用户同名备份；保留用户其他自定义 skill
         let skills = self.codex_home.join("skills");
-        if skills.exists() {
-            let _ = fs::remove_dir_all(&skills);
-            tracing::info!("restore: skills/ removed");
+        let manifest_file = self.codex_home.join(SKILLS_MANIFEST);
+        let backup_dir = self.codex_home.join(SKILLS_BACKUP_DIR);
+
+        let deployed = read_skills_manifest(&manifest_file);
+        let mut skills_restored = 0usize;
+        for id in &deployed {
+            let dst = skills.join(id);
+            if dst.exists() {
+                let _ = fs::remove_dir_all(&dst);
+            }
+            let bak = backup_dir.join(id);
+            if bak.exists() {
+                if copy_dir_recursive(&bak, &dst).is_ok() {
+                    skills_restored += 1;
+                }
+                let _ = fs::remove_dir_all(&bak);
+            }
+        }
+        if backup_dir.exists() {
+            let _ = fs::remove_dir_all(&backup_dir);
+        }
+        if manifest_file.exists() {
+            let _ = fs::remove_file(&manifest_file);
+        }
+        if skills_restored > 0 {
+            tracing::info!("restore: restored {} user skill(s)", skills_restored);
+        } else {
+            tracing::info!("restore: no user skills to restore");
         }
 
         Ok("Codex config restored".to_string())
@@ -354,4 +425,22 @@ fn count_skills(dir: &Path) -> usize {
         }
     }
     count
+}
+
+/// 读取部署清单（本次部署到 ~/.codex/skills/ 的 skill id），失败返回空集
+fn read_skills_manifest(path: &Path) -> std::collections::BTreeSet<String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<std::collections::BTreeSet<String>>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 写入本次部署的 skill id 清单
+fn write_skills_manifest(
+    path: &Path,
+    ids: &std::collections::BTreeSet<String>,
+) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(ids)
+        .unwrap_or_else(|_| "[]".to_string());
+    fs::write(path, json)
 }
