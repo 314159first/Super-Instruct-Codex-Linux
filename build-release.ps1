@@ -25,4 +25,4 @@ if (Test-Path $bundleDir) {
     Write-Host "  Bundle directory not found: $bundleDir" -ForegroundColor Red
 }
 
-Write-Host "=== Build complete ===" -ForegroundColor Cyan
+Write-Host "=== Build complete ===" -ForegroundColor Cyan  
