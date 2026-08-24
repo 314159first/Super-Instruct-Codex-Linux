@@ -31,3 +31,7 @@ tracing-appender = "0.2"
 
 [features]
 default = ["tauri/custom-protocol"]
+
+[profile.dev]
+debug = 0
+incremental = false

@@ -1,6 +1,5 @@
 # Rust
 target/
-Cargo.lock
 
 # Tauri
 src-tauri/target/
@@ -9,7 +8,6 @@ src-tauri/resources/
 
 # Node.js
 node_modules/
-package-lock.json
 
 # Build artifacts
 dist/
@@ -18,6 +16,11 @@ build/
 # Runtime artifacts (generated, not version-controlled)
 logs/
 memory.json
+deployment-artifacts/
+.env
+.env.*
+__pycache__/
+*.pyc
 
 # IDE
 .vscode/

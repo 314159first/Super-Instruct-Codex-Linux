@@ -50,6 +50,7 @@ const el = {
 
 let isRunning = false;
 let logEntries = 0;
+let isRemoteSession = false;
 
 // 类别中文映射
 const categoryMap = {
@@ -170,7 +171,7 @@ function showPreflight(result) {
     const checks = [
         { label: 'Codex 配置目录', pass: result.codex_home_found, detail: result.codex_home_path || '未找到' },
         { label: '中转站地址', pass: result.relay_url_valid, detail: result.relay_url || '未设置' },
-        { label: '端口 8080 可用', pass: result.port_available, detail: result.port_available ? '空闲' : '被占用' },
+        { label: `端口 ${result.proxy_port} 可用`, pass: result.port_available, detail: result.port_available ? '空闲' : '被占用' },
         { label: 'bridge.md 可读', pass: result.bridge_md_readable, detail: result.bridge_md_readable ? '就绪' : '不可读' },
         { label: 'Skills 目录', pass: result.skills_found, detail: result.skills_found ? '就绪' : '未找到' },
     ];
@@ -284,8 +285,12 @@ el.btnClearLog.addEventListener('click', () => {
 async function refreshCodexInfo() {
     try {
         const info = await invoke('get_codex_info');
+        isRemoteSession = info.remote_session === true;
+        el.tbMinimize.style.display = isRemoteSession ? 'none' : '';
+        el.tbClose.style.display = isRemoteSession ? 'none' : '';
         el.cfgCodexHome.textContent = info.codex_home ?? '未检测到';
         el.cfgRelayUrl.textContent = info.relay_url ?? '未知';
+        $('cfg-proxy-url').textContent = info.proxy_url ?? '--';
         el.ssRelay.textContent = info.relay_url ?? '--';
         // 同步填充编辑框（用户未在编辑时才覆盖）
         if (document.activeElement !== el.cfgRelayInput) {
@@ -380,6 +385,9 @@ async function refreshHealth() {
     // Codex 环境检测
     try {
         const info = await invoke('get_codex_info');
+        isRemoteSession = info.remote_session === true;
+        el.tbMinimize.style.display = isRemoteSession ? 'none' : '';
+        el.tbClose.style.display = isRemoteSession ? 'none' : '';
         el.ssRelay.textContent = info.relay_url ?? '--';
 
         if (info.codex_home) {

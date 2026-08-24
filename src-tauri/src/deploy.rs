@@ -5,6 +5,35 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Local listener used by the MITM proxy.  The default remains compatible with
+/// the original desktop application, while headless hosts can choose another
+/// port when a local service already owns 8080.
+pub const DEFAULT_PROXY_PORT: u16 = 8080;
+const PROXY_PORT_ENV: &str = "SUPER_INSTRUCT_PROXY_PORT";
+
+pub fn proxy_port() -> u16 {
+    std::env::var(PROXY_PORT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(DEFAULT_PROXY_PORT)
+}
+
+pub fn proxy_addr() -> String {
+    format!("127.0.0.1:{}", proxy_port())
+}
+
+pub fn proxy_url() -> String {
+    format!("http://{}", proxy_addr())
+}
+
+pub fn is_proxy_url(url: &str) -> bool {
+    let normalized = url.trim().trim_end_matches('/');
+    // Keep recognizing the historical 8080 marker so an interrupted upgrade
+    // can still identify and restore an older deployment.
+    normalized == proxy_url() || normalized == "http://127.0.0.1:8080"
+}
+
 pub struct DeployManager {
     codex_home: PathBuf,
 }
@@ -82,7 +111,7 @@ impl DeployManager {
         // 2. 保存真实中转站地址到 relay_url.txt（只要当前 base_url 不是代理地址）
         if let Some(caps) = re.captures(&content) {
             let current_url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            if !current_url.contains("127.0.0.1:8080") {
+            if !is_proxy_url(current_url) {
                 fs::write(&relay_file, current_url)
                     .map_err(|e| format!("write relay_url.txt failed: {}", e))?;
                 tracing::info!("deploy: relay_url.txt saved: {}", current_url);
@@ -92,7 +121,11 @@ impl DeployManager {
         // 3. 备份 config.toml — 仅当当前配置未指向代理时备份，避免备份污染
         // 如果当前 config.toml 已包含 127.0.0.1:8080，说明上一次 deploy 的备份可能还在，
         // 或者上次未正常退出。此时不覆盖备份，保留已有的干净版本。
-        let already_patched = content.contains("127.0.0.1:8080");
+        let already_patched = re
+            .captures(&content)
+            .and_then(|caps| caps.get(1))
+            .map(|url| is_proxy_url(url.as_str()))
+            .unwrap_or(false);
         if !already_patched {
             fs::copy(&cfg, &bak).map_err(|e| format!("backup failed: {}", e))?;
             tracing::info!("deploy: backed up config.toml -> config.toml.super-instruct-bak");
@@ -100,12 +133,16 @@ impl DeployManager {
             tracing::info!("deploy: config already patched, keeping existing clean backup");
         } else {
             // 已 patched 但无备份 — 极端情况：从 relay_url.txt 恢复 base_url 后再备份
-            tracing::warn!("deploy: config patched but no backup found, restoring base_url from relay_url.txt");
+            tracing::warn!(
+                "deploy: config patched but no backup found, restoring base_url from relay_url.txt"
+            );
             if let Ok(relay_content) = fs::read_to_string(&relay_file) {
                 let relay_url = relay_content.trim();
                 if !relay_url.is_empty() {
-                    let restored = re.replace_all(&content, format!(r#"base_url = "{}""#, relay_url));
-                    fs::write(&cfg, restored.as_ref()).map_err(|e| format!("restore base_url failed: {}", e))?;
+                    let restored =
+                        re.replace_all(&content, format!(r#"base_url = "{}""#, relay_url));
+                    fs::write(&cfg, restored.as_ref())
+                        .map_err(|e| format!("restore base_url failed: {}", e))?;
                     fs::copy(&cfg, &bak).map_err(|e| format!("backup failed: {}", e))?;
                     tracing::info!("deploy: base_url restored from relay_url.txt, then backed up");
                 }
@@ -113,14 +150,18 @@ impl DeployManager {
         }
 
         // 4. 修改 base_url + 补入 model_instructions_file
-        let modified = re.replace_all(&content, r#"base_url = "http://127.0.0.1:8080""#);
+        let modified = re.replace_all(&content, format!(r#"base_url = "{}""#, proxy_url()));
 
         // model_instructions_file: 若已存在则替换，否则在 model = 行后插入，都没有则追加
         let instructions_line = r#"model_instructions_file = "./bridge.md""#;
         let final_config = if modified.contains("model_instructions_file") {
             let re2 = Regex::new(r#"model_instructions_file\s*=\s*"[^"]*""#).unwrap();
             re2.replace_all(&modified, instructions_line).into_owned()
-        } else if modified.contains("model") && modified.lines().any(|l| l.trim_start().starts_with("model")) {
+        } else if modified.contains("model")
+            && modified
+                .lines()
+                .any(|l| l.trim_start().starts_with("model"))
+        {
             // 在 model = 行之后插入
             let mut lines = modified.lines().collect::<Vec<_>>();
             let mut inserted = false;
@@ -305,12 +346,14 @@ impl DeployManager {
         // 如果 config.toml 存在且当前 base_url 不是代理地址，同步更新
         let cfg = self.codex_home.join("config.toml");
         if cfg.exists() {
-            let content = fs::read_to_string(&cfg).map_err(|e| format!("read config failed: {}", e))?;
+            let content =
+                fs::read_to_string(&cfg).map_err(|e| format!("read config failed: {}", e))?;
             // 只有当 base_url 不指向本地代理时才同步（避免覆盖正在运行的代理配置）
-            if !content.contains("127.0.0.1:8080") {
+            if !content.contains(&proxy_url()) && !content.contains("http://127.0.0.1:8080") {
                 let re = Regex::new(r#"base_url\s*=\s*"[^"]*""#).unwrap();
                 let modified = re.replace_all(&content, format!(r#"base_url = "{}""#, url));
-                fs::write(&cfg, modified.as_ref()).map_err(|e| format!("write config failed: {}", e))?;
+                fs::write(&cfg, modified.as_ref())
+                    .map_err(|e| format!("write config failed: {}", e))?;
                 tracing::info!("set_relay_url: config.toml base_url updated to {}", url);
             } else {
                 tracing::info!("set_relay_url: proxy active, config.toml not modified");
@@ -329,13 +372,13 @@ impl DeployManager {
 
         let bridge_active = cfg.exists() && {
             let content = fs::read_to_string(&cfg).unwrap_or_default();
-            content.contains("127.0.0.1:8080")
+            content.contains(&proxy_url()) || content.contains("http://127.0.0.1:8080")
         };
 
         let relay_url_valid = relay_file.exists() && {
             let content = fs::read_to_string(&relay_file).unwrap_or_default();
             let url = content.trim();
-            !url.is_empty() && !url.contains("127.0.0.1:8080")
+            !url.is_empty() && !is_proxy_url(url)
         };
 
         DeployStatus {
@@ -362,7 +405,7 @@ pub fn find_relay_url() -> Option<String> {
     if relay_file.exists() {
         if let Ok(content) = fs::read_to_string(&relay_file) {
             let url = content.trim();
-            if !url.is_empty() && !url.contains("127.0.0.1:8080") {
+            if !url.is_empty() && !is_proxy_url(url) {
                 return Some(url.to_string());
             }
         }
@@ -375,7 +418,7 @@ pub fn find_relay_url() -> Option<String> {
             let re = Regex::new(r#"base_url\s*=\s*"([^"]+)""#).ok()?;
             if let Some(caps) = re.captures(&content) {
                 let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                if !url.contains("127.0.0.1:8080") {
+                if !is_proxy_url(url) {
                     return Some(url.to_string());
                 }
             }
@@ -388,7 +431,7 @@ pub fn find_relay_url() -> Option<String> {
         let re = Regex::new(r#"base_url\s*=\s*"([^"]+)""#).ok()?;
         if let Some(caps) = re.captures(&content) {
             let url = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            if !url.is_empty() && !url.contains("127.0.0.1:8080") {
+            if !url.is_empty() && !is_proxy_url(url) {
                 return Some(url.to_string());
             }
         }
@@ -440,7 +483,6 @@ fn write_skills_manifest(
     path: &Path,
     ids: &std::collections::BTreeSet<String>,
 ) -> std::io::Result<()> {
-    let json = serde_json::to_string_pretty(ids)
-        .unwrap_or_else(|_| "[]".to_string());
+    let json = serde_json::to_string_pretty(ids).unwrap_or_else(|_| "[]".to_string());
     fs::write(path, json)
 }

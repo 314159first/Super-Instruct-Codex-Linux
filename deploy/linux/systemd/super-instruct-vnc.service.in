@@ -1,0 +1,15 @@
+[Unit]
+Description=Super-Instruct localhost VNC bridge
+Requires=super-instruct-gui.service
+After=super-instruct-gui.service
+BindsTo=super-instruct-gui.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/x11vnc -display :@DISPLAY_NUMBER@ -rfbport @VNC_PORT@ -localhost -nopw -forever -shared -noxdamage -repeat
+Restart=always
+RestartSec=2
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

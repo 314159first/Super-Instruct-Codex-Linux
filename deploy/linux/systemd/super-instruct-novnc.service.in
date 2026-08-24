@@ -1,0 +1,15 @@
+[Unit]
+Description=Super-Instruct authenticated noVNC gateway
+Requires=super-instruct-vnc.service
+After=super-instruct-vnc.service
+BindsTo=super-instruct-vnc.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/super-instruct-novnc
+Restart=always
+RestartSec=2
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

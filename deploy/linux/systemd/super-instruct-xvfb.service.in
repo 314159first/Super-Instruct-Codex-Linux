@@ -1,0 +1,14 @@
+[Unit]
+Description=Super-Instruct virtual X display
+After=network.target
+Before=super-instruct-gui.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/Xvfb :@DISPLAY_NUMBER@ -screen 0 @SCREEN_GEOMETRY@ -dpi 96 -nolisten tcp -ac -noreset
+Restart=always
+RestartSec=2
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

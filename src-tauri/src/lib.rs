@@ -7,25 +7,41 @@ pub mod extensions;
 pub mod log;
 pub mod skills;
 
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use futures::StreamExt;
 use serde::Serialize;
-use tauri::Emitter;
-use tauri::Manager;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use futures::StreamExt;
+use tauri::Emitter;
+use tauri::Manager;
+use tokio::sync::RwLock;
 
 /// bridge.md 编译期嵌入 — 运行时文件查找全部失败时的最终 fallback
 const BRIDGE_MD_FALLBACK: &str = include_str!("../../bridge.md");
 
 use crate::core::MitmCore;
-use crate::deploy::{find_relay_url, DeployManager};
+use crate::deploy::{
+    find_relay_url, is_proxy_url, proxy_addr, proxy_port, proxy_url, DeployManager,
+};
 use crate::extensions::inject::SystemPromptInjector;
 use crate::extensions::memory::MemoryKernel;
 use crate::extensions::monitor::{InteractionEvent, MonitorPanel, StatsEvent};
 use crate::extensions::sse_parser::UniversalSseParser;
 use crate::extensions::tamper::TamperEngine;
+
+fn app_state_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("SUPER_INSTRUCT_STATE_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(path).join("super-instruct");
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        return PathBuf::from(home).join(".local/state/super-instruct");
+    }
+    PathBuf::from(".").join(".super-instruct")
+}
 
 // ── AppState ──────────────────────────────────────────────
 pub struct AppState {
@@ -63,12 +79,7 @@ pub fn run() {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "../logs".to_string())
     } else {
-        // Release: 写到 exe 同级目录 (可移植, 可写)
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.join("logs")))
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "logs".to_string())
+        app_state_dir().join("logs").to_string_lossy().to_string()
     };
     let _log_guard = log::init_logging(&log_dir);
 
@@ -211,13 +222,16 @@ async fn probe_api_prefix(url: &str) -> String {
             if status == 404 {
                 tracing::info!(
                     "probe: {} -> 404, base url has no /v1 prefix, using as-is: {}",
-                    probe_url, trimmed
+                    probe_url,
+                    trimmed
                 );
                 trimmed.to_string()
             } else {
                 tracing::info!(
                     "probe: {} -> {}, normalizing base url to {}/v1",
-                    probe_url, status, trimmed
+                    probe_url,
+                    status,
+                    trimmed
                 );
                 format!("{}/v1", trimmed)
             }
@@ -225,7 +239,9 @@ async fn probe_api_prefix(url: &str) -> String {
         Err(e) => {
             tracing::warn!(
                 "probe: {} failed ({}), using base url as-is: {}",
-                probe_url, e, trimmed
+                probe_url,
+                e,
+                trimmed
             );
             trimmed.to_string()
         }
@@ -252,25 +268,31 @@ async fn start_proxy(
     // 2. 读取 bridge.md — 文件查找失败时用编译期嵌入的 fallback
     let instructions = match resolve_resource_file(&app, "bridge.md") {
         Ok(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            tracing::warn!("start_proxy: read bridge.md failed ({}), using embedded fallback", e);
+            tracing::warn!(
+                "start_proxy: read bridge.md failed ({}), using embedded fallback",
+                e
+            );
             BRIDGE_MD_FALLBACK.to_string()
         }),
         Err(e) => {
-            tracing::warn!("start_proxy: bridge.md file lookup failed ({}), using embedded fallback", e);
+            tracing::warn!(
+                "start_proxy: bridge.md file lookup failed ({}), using embedded fallback",
+                e
+            );
             BRIDGE_MD_FALLBACK.to_string()
         }
     };
 
     // 3. 部署 — bridge_active 不足以判断完整部署，需验证 bridge_exists 和 relay_url_valid
     let status = manager.status();
-    let needs_deploy = !status.bridge_active
-        || !status.bridge_exists
-        || !status.relay_url_valid;
+    let needs_deploy = !status.bridge_active || !status.bridge_exists || !status.relay_url_valid;
 
     if needs_deploy {
         tracing::info!(
             "start_proxy: deploying (bridge_active={}, bridge_exists={}, relay_valid={})",
-            status.bridge_active, status.bridge_exists, status.relay_url_valid
+            status.bridge_active,
+            status.bridge_exists,
+            status.relay_url_valid
         );
         let skills_dir = resolve_resource_dir(&app, "codex-skills").ok();
         if skills_dir.is_none() {
@@ -289,7 +311,7 @@ async fn start_proxy(
 
     // 4. 验证 relay URL — 无有效地址则阻断启动（防自环）
     let relay_url_raw = match find_relay_url() {
-        Some(url) if !url.contains("127.0.0.1:8080") => url,
+        Some(url) if !is_proxy_url(&url) => url,
         _ => {
             tracing::error!("start_proxy: no valid relay URL found");
             return Err("未找到有效的中转站地址。请在配置页设置中转站 URL 后再启动代理。".into());
@@ -299,7 +321,11 @@ async fn start_proxy(
     // 4b. 智能识别 API 路径前缀 — 探测 {url}/v1/models 是否存在
     let relay_url = probe_api_prefix(&relay_url_raw).await;
     let relay_url_display = relay_url.clone();
-    tracing::info!("start_proxy: relay_url = {} (raw: {})", relay_url_display, relay_url_raw);
+    tracing::info!(
+        "start_proxy: relay_url = {} (raw: {})",
+        relay_url_display,
+        relay_url_raw
+    );
 
     // 5. 创建扩展实例
     let monitor = Arc::new(MonitorPanel::new(app.clone()));
@@ -310,11 +336,10 @@ async fn start_proxy(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "../memory.json".to_string())
     } else {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.join("memory.json")))
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "memory.json".to_string())
+        app_state_dir()
+            .join("memory.json")
+            .to_string_lossy()
+            .to_string()
     };
     let memory = Arc::new(MemoryKernel::new(&memory_path));
 
@@ -336,16 +361,24 @@ async fn start_proxy(
     );
 
     // 7. 同步绑定端口 — 失败则回滚部署，不修改 AppState
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
+    let listener = tokio::net::TcpListener::bind(proxy_addr())
         .await
         .map_err(|e| {
-            tracing::error!("start_proxy: port 8080 bind failed, rolling back deploy: {}", e);
+            tracing::error!(
+                "start_proxy: port {} bind failed, rolling back deploy: {}",
+                proxy_port(),
+                e
+            );
             if let Some(m) = DeployManager::new() {
                 let _ = m.restore();
             }
-            format!("端口 8080 绑定失败: {}。可能代理已在运行或端口被占用。", e)
+            format!(
+                "端口 {} 绑定失败: {}。可能代理已在运行或端口被占用。",
+                proxy_port(),
+                e
+            )
         })?;
-    tracing::info!("start_proxy: port 8080 bound successfully");
+    tracing::info!("start_proxy: port {} bound successfully", proxy_port());
 
     // 8. 启动 axum server（listener 已绑定，不会再 panic）
     let core_for_server = core.clone();
@@ -353,9 +386,18 @@ async fn start_proxy(
     let handle = tokio::spawn(async move {
         let app = axum::Router::new()
             .route("/", axum::routing::get(health_check))
-            .route("/{*path}", axum::routing::any(move |req| handle_proxy(req, core_for_server.clone())));
-        tracing::info!("Proxy listening on :8080 -> {}", relay_url_for_log);
-        axum::serve(listener, app).await.expect("proxy server error");
+            .route(
+                "/{*path}",
+                axum::routing::any(move |req| handle_proxy(req, core_for_server.clone())),
+            );
+        tracing::info!(
+            "Proxy listening on :{} -> {}",
+            proxy_port(),
+            relay_url_for_log
+        );
+        axum::serve(listener, app)
+            .await
+            .expect("proxy server error");
     });
 
     // 9. 存入 AppState
@@ -367,23 +409,32 @@ async fn start_proxy(
     let _ = app.emit("proxy-status", "running");
 
     // 推送系统日志到交互面板
-    let _ = app.emit("interaction", InteractionEvent {
-        id: 0,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        category: "system".into(),
-        user_preview: "启动代理".into(),
-        ai_preview: format!("代理已启动 → 127.0.0.1:8080 → {}", relay_url_display),
-        thinking_preview: String::new(),
-        tampered: false,
-        bytes: 0,
-        duration_ms: 0,
-    });
+    let _ = app.emit(
+        "interaction",
+        InteractionEvent {
+            id: 0,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            category: "system".into(),
+            user_preview: "启动代理".into(),
+            ai_preview: format!("代理已启动 → {} → {}", proxy_url(), relay_url_display),
+            thinking_preview: String::new(),
+            tampered: false,
+            bytes: 0,
+            duration_ms: 0,
+        },
+    );
 
-    tracing::info!("start_proxy: proxy running on :8080 -> {}", relay_url_display);
+    tracing::info!(
+        "start_proxy: proxy running on :{} -> {}",
+        proxy_port(),
+        relay_url_display
+    );
 
     Ok(format!(
-        "Proxy running on :8080 -> {} | rules: {}",
-        relay_url_display, rule_count
+        "Proxy running on :{} -> {} | rules: {}",
+        proxy_port(),
+        relay_url_display,
+        rule_count
     ))
 }
 
@@ -419,21 +470,27 @@ async fn stop_proxy(
     let _ = app.emit("proxy-status", "stopped");
 
     // 推送系统日志到交互面板
-    let _ = app.emit("interaction", InteractionEvent {
-        id: 0,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        category: "system".into(),
-        user_preview: "停止代理".into(),
-        ai_preview: format!("代理已停止，Codex 配置已自动还原 ({})", restore_msg),
-        thinking_preview: String::new(),
-        tampered: false,
-        bytes: 0,
-        duration_ms: 0,
-    });
+    let _ = app.emit(
+        "interaction",
+        InteractionEvent {
+            id: 0,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            category: "system".into(),
+            user_preview: "停止代理".into(),
+            ai_preview: format!("代理已停止，Codex 配置已自动还原 ({})", restore_msg),
+            thinking_preview: String::new(),
+            tampered: false,
+            bytes: 0,
+            duration_ms: 0,
+        },
+    );
 
     tracing::info!("stop_proxy: proxy stopped, codex config restored");
 
-    Ok(format!("Proxy stopped, codex config restored ({})", restore_msg))
+    Ok(format!(
+        "Proxy stopped, codex config restored ({})",
+        restore_msg
+    ))
 }
 
 #[tauri::command]
@@ -443,11 +500,17 @@ async fn deploy_bridge(app: tauri::AppHandle) -> Result<String, String> {
     // bridge.md: 文件查找优先，fallback 用编译期嵌入版本
     let bridge_md = match resolve_resource_file(&app, "bridge.md") {
         Ok(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            tracing::warn!("deploy_bridge: read bridge.md failed ({}), using embedded fallback", e);
+            tracing::warn!(
+                "deploy_bridge: read bridge.md failed ({}), using embedded fallback",
+                e
+            );
             BRIDGE_MD_FALLBACK.to_string()
         }),
         Err(e) => {
-            tracing::warn!("deploy_bridge: bridge.md file lookup failed ({}), using embedded fallback", e);
+            tracing::warn!(
+                "deploy_bridge: bridge.md file lookup failed ({}), using embedded fallback",
+                e
+            );
             BRIDGE_MD_FALLBACK.to_string()
         }
     };
@@ -508,6 +571,9 @@ async fn get_codex_info() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({
         "codex_home": home.map(|p| p.display().to_string()),
         "relay_url": relay,
+        "proxy_port": proxy_port(),
+        "proxy_url": proxy_url(),
+        "remote_session": std::env::var_os("SUPER_INSTRUCT_REMOTE_SESSION").is_some(),
     }))
 }
 
@@ -522,6 +588,7 @@ struct PreflightResult {
     port_available: bool,
     bridge_md_readable: bool,
     skills_found: bool,
+    proxy_port: u16,
     errors: Vec<String>,
 }
 
@@ -541,7 +608,7 @@ async fn preflight_check(app: tauri::AppHandle) -> Result<PreflightResult, Strin
     let relay_url_raw = find_relay_url();
     let relay_url_valid = relay_url_raw
         .as_ref()
-        .map(|u| !u.is_empty() && !u.contains("127.0.0.1:8080"))
+        .map(|u| !u.is_empty() && !is_proxy_url(u))
         .unwrap_or(false);
     if !relay_url_valid {
         errors.push("未找到有效的中转站地址，请在配置页设置中转站 URL".into());
@@ -558,11 +625,9 @@ async fn preflight_check(app: tauri::AppHandle) -> Result<PreflightResult, Strin
     };
 
     // 3. 端口可用性 — bind 成功后立即 drop
-    let port_available = tokio::net::TcpListener::bind("127.0.0.1:8080")
-        .await
-        .is_ok();
+    let port_available = tokio::net::TcpListener::bind(proxy_addr()).await.is_ok();
     if !port_available {
-        errors.push("端口 8080 被占用，可能代理已在运行".into());
+        errors.push(format!("端口 {} 被占用，可能代理已在运行", proxy_port()));
     }
 
     // 4. bridge.md 可读性
@@ -588,6 +653,7 @@ async fn preflight_check(app: tauri::AppHandle) -> Result<PreflightResult, Strin
         port_available,
         bridge_md_readable,
         skills_found,
+        proxy_port: proxy_port(),
         errors,
     })
 }
@@ -612,7 +678,7 @@ async fn get_deploy_status() -> Result<serde_json::Value, String> {
         }
         None => Ok(serde_json::json!({
             "codex_home_found": false,
-        }))
+        })),
     }
 }
 
@@ -625,8 +691,7 @@ async fn set_relay_url(url: String) -> Result<String, String> {
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         return Err("URL must start with http:// or https://".into());
     }
-    let manager = DeployManager::new()
-        .ok_or_else(|| "Codex home not found".to_string())?;
+    let manager = DeployManager::new().ok_or_else(|| "Codex home not found".to_string())?;
     manager.set_relay_url(&trimmed)?;
     Ok(format!("Relay URL saved: {}", trimmed))
 }
@@ -792,9 +857,16 @@ fn wrap_tamper_as_sse(text: &str) -> bytes::Bytes {
 fn is_request_hop_header(name: &str) -> bool {
     matches!(
         name,
-        "host" | "content-length" | "content-type" | "connection"
-            | "keep-alive" | "proxy-connection" | "te" | "trailer"
-            | "transfer-encoding" | "upgrade"
+        "host"
+            | "content-length"
+            | "content-type"
+            | "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
     )
 }
 
@@ -802,8 +874,15 @@ fn is_request_hop_header(name: &str) -> bool {
 fn is_response_hop_header(name: &str) -> bool {
     matches!(
         name,
-        "connection" | "keep-alive" | "proxy-connection" | "te" | "trailer"
-            | "transfer-encoding" | "upgrade" | "content-length" | "content-encoding"
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+            | "content-encoding"
     )
 }
 
@@ -850,12 +929,7 @@ async fn handle_proxy(
 
     // 阶段 1: 请求拦截 + 转发上游
     let upstream = match core
-        .handle_request(
-            parts.method,
-            path_and_query,
-            parts.headers,
-            bytes,
-        )
+        .handle_request(parts.method, path_and_query, parts.headers, bytes)
         .await
     {
         Ok(u) => u,
@@ -864,17 +938,13 @@ async fn handle_proxy(
             return axum::response::Response::builder()
                 .status(axum::http::StatusCode::BAD_GATEWAY)
                 .header("Content-Type", "application/json")
-                .body(axum::body::Body::from(format!(
-                    "{{\"error\": \"{}\"}}",
-                    e
-                )))
+                .body(axum::body::Body::from(format!("{{\"error\": \"{}\"}}", e)))
                 .unwrap();
         }
     };
 
-    let status = axum::http::StatusCode::from_u16(upstream.status).unwrap_or(
-        axum::http::StatusCode::OK,
-    );
+    let status =
+        axum::http::StatusCode::from_u16(upstream.status).unwrap_or(axum::http::StatusCode::OK);
     let content_type = upstream.content_type.clone();
     let is_sse = content_type
         .as_deref()
@@ -882,8 +952,7 @@ async fn handle_proxy(
         .unwrap_or(false);
 
     // BUG-4 修复: keepalive channel 从上游请求发出时即开始计时
-    let (tx, rx) =
-        tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, std::io::Error>>();
     let core_clone = core.clone();
     let meta = upstream.meta;
     let upstream_status = upstream.status;
@@ -898,8 +967,7 @@ async fn handle_proxy(
 
         if is_sse {
             // SSE: 缓冲上游 chunk, 每 500ms 发 keepalive 注释防 CLI 超时
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             interval.tick().await; // 跳过首次立即触发
 
             loop {
@@ -1034,7 +1102,10 @@ fn find_resource_dir(name: &str) -> Result<std::path::PathBuf, String> {
             return Ok(p.clone());
         }
     }
-    Err(format!("{} directory not found (searched: {:?})", name, candidates))
+    Err(format!(
+        "{} directory not found (searched: {:?})",
+        name, candidates
+    ))
 }
 
 /// 生成所有候选路径：CWD、exe 目录、以及它们的上级（覆盖 dev / cargo run / raw exe 场景）

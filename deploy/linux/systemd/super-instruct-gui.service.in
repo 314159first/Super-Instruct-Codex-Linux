@@ -1,0 +1,33 @@
+[Unit]
+Description=Super-Instruct Tauri desktop session
+Requires=super-instruct-xvfb.service
+After=super-instruct-xvfb.service
+BindsTo=super-instruct-xvfb.service
+
+[Service]
+Type=simple
+User=@APP_USER@
+Group=@APP_GROUP@
+WorkingDirectory=@APP_HOME@
+RuntimeDirectory=super-instruct
+RuntimeDirectoryMode=0700
+Environment=DISPLAY=:@DISPLAY_NUMBER@
+Environment=HOME=@APP_HOME@
+Environment=USER=@APP_USER@
+Environment=GDK_BACKEND=x11
+Environment=LIBGL_ALWAYS_SOFTWARE=1
+Environment=WEBKIT_DISABLE_COMPOSITING_MODE=1
+Environment=WEBKIT_DISABLE_DMABUF_RENDERER=1
+Environment=SUPER_INSTRUCT_PROXY_PORT=@PROXY_PORT@
+Environment=SUPER_INSTRUCT_REMOTE_SESSION=1
+Environment=SUPER_INSTRUCT_STATE_DIR=/var/lib/super-instruct
+Environment=CODEX_HOME=@CODEX_HOME@
+Environment=XDG_RUNTIME_DIR=/run/super-instruct
+ExecStart=/usr/bin/dbus-run-session -- /usr/local/libexec/super-instruct-desktop-inner
+ExecStopPost=/usr/local/libexec/super-instruct-restore-codex
+Restart=always
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

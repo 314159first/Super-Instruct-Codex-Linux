@@ -56,13 +56,117 @@ Codex CLI ──HTTP :8080──▶ MITM Core (管道编排)
 - Node.js 18+
 - npm 10+
 
+Ubuntu 24.04 还需要安装 Tauri 的 Linux 系统依赖：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential curl file libssl-dev patchelf \
+  libwebkit2gtk-4.1-dev libgtk-3-dev \
+  libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y --profile minimal --default-toolchain stable
+source "$HOME/.cargo/env"
+```
+
 ### 开发模式
 
 ```bash
-cd /path/to/Super-Instruct-Codex-5.6
+cd ~/Super-Instruct-Codex-5.6
 npm install
 npx tauri dev
 ```
+
+`tauri dev` 是桌面 GUI 程序，需要图形会话。纯 SSH/TTY 服务器可以完成构建，
+但要直接操作界面需使用桌面环境、VNC 或 X11 转发。它的前端依赖
+`window.__TAURI__`，不能作为普通静态网页单独部署。
+
+若本机 `8080` 已被其他服务占用，可在启动应用前设置本地代理端口：
+
+```bash
+SUPER_INSTRUCT_PROXY_PORT=18080 npx tauri dev
+```
+
+### SSH 服务器上的浏览器访问
+
+本项目的完整界面必须运行在 Tauri 窗口中。仓库提供的 Linux 服务配置会在
+`:99` 虚拟显示中启动应用，并通过 noVNC 发布到 `6080`。
+
+在 Ubuntu 22.04/24.04 服务器上执行：
+
+```bash
+git clone https://github.com/314159first/Super-Instruct-Codex-Linux.git
+cd Super-Instruct-Codex-Linux
+sudo APP_USER="$USER" bash deploy/linux/install-server.sh
+```
+
+安装器会自动安装 Rust、Node.js、Tauri/GTK、Xvfb、Openbox、x11vnc 和 noVNC，
+构建 release 二进制，生成随机 noVNC 登录密码并启动四个 systemd 服务。
+
+Codex CLI 需提前安装在 `APP_USER` 对应账户下，并至少运行过一次以生成
+`~/.codex/config.toml`。中转站地址可在界面的“配置管理”中填写，也可安装时传入：
+
+```bash
+sudo APP_USER="$USER" \
+  RELAY_URL="https://your-relay.example/v1" \
+  bash deploy/linux/install-server.sh
+```
+
+浏览器访问：
+
+```text
+http://SERVER_IP:6080/vnc.html?autoconnect=1&resize=remote&path=websockify
+```
+
+noVNC 使用 HTTP Basic Auth；认证文件位于 `/etc/super-instruct/novnc.auth`。
+VNC 后端只监听 `127.0.0.1:5900`，应用在该服务环境中使用
+`SUPER_INSTRUCT_PROXY_PORT=18080`，以避开已占用的本地 `8080`。
+
+查看生成的登录凭据：
+
+```bash
+sudo cat /etc/super-instruct/novnc.auth
+```
+
+常用安装变量：
+
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `APP_USER` | `SUDO_USER` 或当前用户 | 运行 Tauri/Codex 的 Linux 用户 |
+| `PROXY_PORT` | `18080` | Codex 本地 MITM 代理端口 |
+| `VNC_PORT` | `5900` | 仅本机监听的 VNC 端口 |
+| `NOVNC_PORT` | `6080` | 公网浏览器入口端口 |
+| `DISPLAY_NUMBER` | `99` | Xvfb display 编号 |
+| `SCREEN_GEOMETRY` | `1280x800x24` | 虚拟桌面分辨率和色深 |
+| `NOVNC_USER` | `superadmin` | noVNC HTTP 登录用户名 |
+| `RELAY_URL` | 空 | 可选的上游 API 地址 |
+
+公网使用时应在云防火墙中只开放需要的来源，并用 Nginx/Caddy 为 `6080`
+配置 HTTPS 反向代理；Basic Auth 不应长期通过明文 HTTP 传输。
+
+查看服务状态：
+
+```bash
+systemctl status super-instruct-xvfb super-instruct-gui super-instruct-vnc super-instruct-novnc
+```
+
+卸载服务并保留认证及状态数据：
+
+```bash
+sudo bash deploy/linux/uninstall-server.sh
+```
+
+同时删除 `/etc/super-instruct` 与 `/var/lib/super-instruct`：
+
+```bash
+sudo PURGE=1 bash deploy/linux/uninstall-server.sh
+```
+
+停止或卸载 GUI 服务时，systemd 会调用还原脚本恢复 Codex 配置并清理本项目部署的
+bridge/skills，避免 Codex 留在失效的本地代理地址。
+
+项目已关闭开发构建的增量缓存和调试符号，适合小磁盘服务器，避免首次编译占满磁盘。
 
 ### Release 构建
 
@@ -70,7 +174,8 @@ npx tauri dev
 npx tauri build
 ```
 
-产物输出到 `src-tauri/target/release/bundle/`。
+Linux 默认生成 `.deb`，Windows 默认生成 NSIS/MSI。产物输出到
+`src-tauri/target/release/bundle/`。
 
 ### 使用方式
 
@@ -84,6 +189,8 @@ npx tauri build
 
 ```
 Super-Instruct-Codex-5.6/
+├── deploy/linux/                   # Linux 服务器安装器、systemd 模板、noVNC 启动器
+├── .github/workflows/              # Linux .deb 自动构建
 ├── bridge.md                      # 破甲指令集（注入到 system role）
 ├── codex-skills/                  # 28 个 Codex 技能模块（部署到 ~/.codex/skills/）
 ├── frontend/
