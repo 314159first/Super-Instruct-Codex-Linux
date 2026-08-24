@@ -35,6 +35,9 @@ jobs:
       - name: Install Node dependencies
         run: npm ci
 
+      - name: Prepare Tauri resources
+        run: npm run copy-resources
+
       - name: Check Rust backend
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml
 
